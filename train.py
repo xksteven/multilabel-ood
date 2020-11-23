@@ -1,25 +1,149 @@
-import sys
-import torch
 import argparse
+import itertools
 import numpy as np
+import os
+import sys
+import random
+import sklearn.metrics as metrics
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision
 import torchvision.models as models
 
+from augmix import AugMix
 from torch.autograd import Variable
 from torch.utils import data
 from PIL import Image
+from utils.dataloader.fashion2_loader import *
 from utils.dataloader.pascal_voc_loader import *
 from utils.dataloader.coco_loader import *
-from scipy.misc import toimage
-import random
-# import tqdm
+from tqdm import tqdm
 import torchvision.transforms as transforms
-#---- your own transformations
+#---- own transformations
 from utils.transform import ReLabel, ToLabel, ToSP, Scale
 
-from model.classifiersimple import *
-import torchvision
+import model.bit_models as bit_models
+from model.se_resnet import se_resnet50 
+from model.classifiersimple import clssimp
+
+
+def speckle_noise_torch(data):
+    """samples speckle noise according to the list stds, adds it to data
+       and returns the noisy data.
+    """
+    stds = [.15, .2, 0.35, 0.45, 0.6]
+    c = np.random.choice(stds, data.shape[0], replace=True)
+    noise = torch.empty(data.shape, device=data.device).normal_() * torch.Tensor(c).view(-1, 1, 1).to(data.device)
+    scaled_noise = data * noise
+
+    #assert (scaled_noise.shape == data.shape), "Shape of scaled speckle noise does not equal the shape of the input!"
+				        
+    return torch.clamp(data + scaled_noise, 0, 1)
+
+
+def train_model(
+        args, train_loader, valloader, optimizer, 
+        model, clsfier, criterion, scheduler, 
+        device, use_dataparallel):
+
+    best_model = (model, clsfier)
+    best_res = 0
+
+    for epoch in range(args.n_epochs):
+        for i, (images, labels) in enumerate(tqdm(train_loader)):
+            if args.augmix:
+                x_mix1, x_orig = images
+                images = torch.cat((x_mix1, x_orig), 0).to(device)
+            else: 
+                images = images.to(device)
+            labels = labels.to(device).float()
+
+            optimizer.zero_grad()
+            
+            outputs = model(images)
+            outputs = clsfier(outputs)
+            if args.augmix:
+                l_mix1, outputs = torch.split(outputs, x_orig.size(0))
+
+            if args.loss == "bce":
+                if args.augmix:
+                    if random.random() > 0.5:
+                        loss = criterion(outputs, labels)
+                    else:
+                        loss = criterion(l_mix1, labels)
+                else:
+                    loss = criterion(outputs, labels)
+            else:
+                print("Invalid loss please use --loss bce")
+                exit()
+
+            loss.backward()
+            optimizer.step()
+            if args.use_scheduler:
+                scheduler.step()
+
+        #print(len(train_loader))
+        #print("Epoch [%d/%d] Loss: %.4f" % (epoch+1, args.n_epochs, loss.data))
+        if epoch % args.eval_every == 0:
+            res = validate(args, valloader, model, clsfier)
+            model.train()
+            clsfier.train()
+            print("MAP = ", res)
+            if res > best_res:
+                save_root = os.path.join(args.save_dir,args.arch)
+                if not os.path.exists(save_root):
+                    os.makedirs(save_root)
+                if use_dataparallel:
+                    torch.save(model.module.state_dict(), os.path.join(save_root, str(args.desc) + ".pth"))
+                    torch.save(clsfier.module.state_dict(), os.path.join(save_root, "clssegsimp" + str(args.desc) + ".pth"))
+                else:
+                    torch.save(model.state_dict(), os.path.join(save_root, str(args.desc) +  ".pth"))
+                    torch.save(clsfier.state_dict(), os.path.join(save_root, 'clssegsimp' + str(args.desc) +  ".pth"))
+                best_res = res
+               
+    return model, clsfier, optimizer
+
+def validate(args, valloader, model, clsfier):
+    model.eval()
+    clsfier.eval()
+    
+    gts = {i:[] for i in range(0,args.num_classes)}
+    preds = {i:[] for i in range(0,args.num_classes)}
+    # gts, preds = [], []
+    for i, (images, labels) in tqdm(enumerate(valloader)):
+        images = images.cuda()
+        labels = labels.cuda().float()
+        
+        outputs = model(images)
+        outputs = clsfier(outputs)
+        outputs = F.sigmoid(outputs)
+        pred = outputs.data.cpu().numpy()
+        gt = labels.data.cpu().numpy()
+        
+        for label in range(0, args.num_classes):
+            gts[label].extend(gt[:,label])
+            preds[label].extend(pred[:,label])
+
+    FinalMAPs = []
+    for i in range(0, args.num_classes):
+        precision, recall, thresholds = metrics.precision_recall_curve(gts[i], preds[i]);
+        FinalMAPs.append(metrics.auc(recall , precision));
+    #print(FinalMAPs)
+    tmp = []
+    for i in range(len(gts)):
+        tmp.append(gts[i])
+    gts = np.array(tmp)
+
+    FinalMAPs = np.array(FinalMAPs)
+    denom = gts.sum()
+    gts = gts.sum(axis=-1)
+    gts = gts / denom
+    res = np.nan_to_num(FinalMAPs * gts)
+    #print("MAP = ", (res).sum())
+    return res.mean()
+
+
 
 def train(args):
     if not os.path.exists(args.save_dir):
@@ -27,117 +151,288 @@ def train(args):
 
     normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                      std=[0.229, 0.224, 0.225])
-    img_transform = transforms.Compose([
+    if args.augmix:
+        train_transform = transforms.Compose([
             transforms.RandomHorizontalFlip(),
-            # transforms.RandomRotation((-30,30)),
-            # transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.1, hue=0.1),
-            # transforms.Scale((256,256)),
-            # transforms.RandomResizedCrop((256)),
-            transforms.RandomResizedCrop((256),scale=(0.5, 2.0)),
+            transforms.RandomResizedCrop((args.img_size),scale=(0.5, 2.0)),
+        ])  
+    elif args.speckle:
+        train_transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomResizedCrop((args.img_size),scale=(0.5, 2.0)),
+            transforms.ToTensor(),
+            transforms.RandomApply([transforms.Lambda(lambda x: speckle_noise_torch(x))], p=0.5),
+            normalize,
+        ])
+    else:
+        train_transform = transforms.Compose([
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomResizedCrop((args.img_size),scale=(0.5, 2.0)),
+            transforms.ToTensor(),
+            normalize,
+        ])
+    if args.cutout:
+        train_transform.transforms.append(transforms.RandomErasing())
+
+    val_transform = transforms.Compose([
+            transforms.Scale((args.img_size, args.img_size)),
             transforms.ToTensor(),
             normalize,
         ])
 
+
     label_transform = transforms.Compose([
             ToLabel(),
         ])
-
-    if args.dataset == "pascal":
+    print("Loading Data")
+    if args.dataset == "deepfashion2":
+        loader = fashion2loader(
+            "../",
+            transform = train_transform,
+            label_transform = label_transform,
+            #scales=(-1), occlusion=(-1), zoom=(-1), viewpoint=(-1), negate=(True,True,True,True),
+            scales=args.scales, occlusion=args.occlusion, zoom=args.zoom, viewpoint=args.viewpoint,
+            negate=args.negate,
+            #load=True,
+            )
+        if args.augmix:
+            loader = AugMix(loader, args.augmix)
+        if args.stylize:
+            style_loader = fashion2loader(
+                root="../../stylize-datasets/output/",
+                transform = train_transform,
+                label_transform = label_transform,
+                #scales=(-1), occlusion=(-1), zoom=(-1), viewpoint=(-1), negate=(True,True,True,True),
+                scales=args.scales, occlusion=args.occlusion, zoom=args.zoom, viewpoint=args.viewpoint,
+                negate=args.negate,
+                #load=True,
+                )
+            loader = torch.utils.data.ConcatDataset([loader, style_loader])
+        valloader = fashion2loader(
+            "../",
+            split="validation",
+            transform = val_transform,
+            label_transform = label_transform,
+            #scales=(-1), occlusion=(-1), zoom=(-1), viewpoint=(-1), negate=(True,True,True,True),
+            scales=args.scales, occlusion=args.occlusion, zoom=args.zoom, viewpoint=args.viewpoint,
+            negate=args.negate,
+            )
+    elif args.dataset == "deepaugment":
+        loader = fashion2loader(
+            "../",
+            transform = train_transform,
+            label_transform = label_transform,
+            #scales=(-1), occlusion=(-1), zoom=(-1), viewpoint=(-1), negate=(True,True,True,True),
+            scales=args.scales, occlusion=args.occlusion, zoom=args.zoom, viewpoint=args.viewpoint,
+            negate=args.negate,
+            #load=True,
+            )  
+        loader1 = fashion2loader(
+            root="../../deepaugment/EDSR/",
+            transform = train_transform,
+            label_transform = label_transform,
+            #scales=(-1), occlusion=(-1), zoom=(-1), viewpoint=(-1), negate=(True,True,True,True),
+            scales=args.scales, occlusion=args.occlusion, zoom=args.zoom, viewpoint=args.viewpoint,
+            negate=args.negate,
+            #load=True,
+            )
+        loader2 = fashion2loader(
+            root="../../deepaugment/CAE/",
+            transform = train_transform,
+            label_transform = label_transform,
+            #scales=(-1), occlusion=(-1), zoom=(-1), viewpoint=(-1), negate=(True,True,True,True),
+            scales=args.scales, occlusion=args.occlusion, zoom=args.zoom, viewpoint=args.viewpoint,
+            negate=args.negate,
+            #load=True,
+            )
+        loader = torch.utils.data.ConcatDataset([loader, loader1, loader2])
+        if args.augmix:
+            loader = AugMix(loader, args.augmix)
+        if args.stylize:
+            style_loader = fashion2loader(
+                root="../../stylize-datasets/output/",
+                transform = train_transform,
+                label_transform = label_transform,
+                #scales=(-1), occlusion=(-1), zoom=(-1), viewpoint=(-1), negate=(True,True,True,True),
+                scales=args.scales, occlusion=args.occlusion, zoom=args.zoom, viewpoint=args.viewpoint,
+                negate=args.negate,
+                #load=True,
+                )
+            loader = torch.utils.data.ConcatDataset([loader, style_loader])
+        valloader = fashion2loader(
+            "../",
+            split="validation",
+            transform = val_transform,
+            label_transform = label_transform,
+            #scales=(-1), occlusion=(-1), zoom=(-1), viewpoint=(-1), negate=(True,True,True,True),
+            scales=args.scales, occlusion=args.occlusion, zoom=args.zoom, viewpoint=args.viewpoint,
+            negate=args.negate,
+            )
+    elif args.dataset == "pascal":
         loader = pascalVOCLoader(
                                  "./datasets/pascal/", 
-                                 img_transform = img_transform, 
+                                 img_transform = train_transform, 
                                  label_transform = label_transform)
+        valloader = pascalVOCLoader(
+                                 "./datasets/pascal/", 
+                                 split="voc12-val",
+                                 img_transform = val_transform, 
+                                 label_transform = label_transform)
+ 
     elif args.dataset == "coco":
         loader = cocoloader(
                             "./datasets/coco/", 
-                             img_transform = img_transform, 
+                             img_transform = train_transform, 
+                             label_transform = label_transform)
+        valloader = cocoloader(
+                            "./datasets/coco/",
+                             split="multi-label-val2014",
+                             img_transform = val_transform, 
                              label_transform = label_transform)
     else:
         raise AssertionError
-    n_classes = loader.n_classes
-    trainloader = data.DataLoader(loader, batch_size=args.batch_size, num_workers=4, shuffle=True)
+    print("Loading Done")
+
+    train_loader = data.DataLoader(loader, batch_size=args.batch_size, num_workers=args.num_workers, drop_last=True, shuffle=True)
+    val_loader = data.DataLoader(valloader, batch_size=args.batch_size, num_workers=args.num_workers, drop_last=False, shuffle=False)
 
 
-    print("number of images = ", len(loader))
-    print("number of classes = ", n_classes, " architecture used = ", args.arch)
+    print("number of images = ", len(train_loader))
 
 
-    orig_resnet = torchvision.models.resnet101(pretrained=True)
-    features = list(orig_resnet.children())
-    model= nn.Sequential(*features[0:8])
-    clsfier = clssimp(2048,n_classes)
-
+    print("Loading arch = ", args.arch)
+    if args.arch == "resnet101":
+        orig_resnet = torchvision.models.resnet101(pretrained=True)
+        features = list(orig_resnet.children())
+        model= nn.Sequential(*features[0:8])
+        clsfier = clssimp(2048, args.num_classes)
+    elif args.arch == "resnet50":
+        orig_resnet = torchvision.models.resnet50(pretrained=True)
+        features = list(orig_resnet.children())
+        model= nn.Sequential(*features[0:8])
+        clsfier = clssimp(2048, args.num_classes)
+    elif args.arch == "resnet152":
+        orig_resnet = torchvision.models.resnet152(pretrained=True)
+        features = list(orig_resnet.children())
+        model= nn.Sequential(*features[0:8])
+        clsfier = clssimp(2048, args.num_classes)
+    elif args.arch == "se":
+        model = se_resnet50(pretrained=True)
+        features = list(model.children())
+        model= nn.Sequential(*features[0:8])
+        clsfier = clssimp(2048, args.num_classes)
+    elif args.arch == "BiT-M-R50x1":
+        model = bit_models.KNOWN_MODELS[args.arch](head_size=2048, zero_head=True)
+        model.load_from(np.load(f"{args.arch}.npz"))
+        features = list(model.children())
+        model= nn.Sequential(*features[0:8])
+        clsfier = clssimp(2048, argrs.num_classes)
+    elif args.arch == "BiT-M-R101x1":
+        model = bit_models.KNOWN_MODELS[args.arch](head_size=2048, zero_head=True)
+        model.load_from(np.load(f"{args.arch}.npz"))
+        features = list(model.children())
+        model= nn.Sequential(*features[0:8])
+        clsfier = clssimp(2048, args.num_classes)
+ 
 
     if args.load == 1:
-        model.load_state_dict(torch.load('savedmodels/' + args.arch + str(args.disc) +  ".pth"))
-        clsfier.load_state_dict(torch.load('savedmodels/' + args.arch +'clssegsimp' + str(args.disc) +  ".pth"))
+        model.load_state_dict(torch.load(args.save_dir + args.arch + str(args.desc) +  ".pth"))
+        clsfier.load_state_dict(torch.load(args.save_dir + args.arch +"clssegsimp" + str(args.desc) +  ".pth"))
 
-    if torch.cuda.is_available():
-        model.cuda(0)
-        clsfier.cuda(0)
+    gpu_ids = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    use_dataparallel = len(gpu_ids) > 1
+    print("using data parallel = ", use_dataparallel, device, gpu_ids)
+    if use_dataparallel:
+        gpu_ids = [int(x) for x in range(len(gpu_ids))]
+        model = nn.DataParallel(model, device_ids=gpu_ids)
+        clsfier = nn.DataParallel(clsfier, device_ids=gpu_ids)
+    model.to(device)
+    clsfier.to(device)
+
+    if args.finetune:
+        if args.opt == "adam":
+            optimizer = torch.optim.Adam([{'params': clsfier.parameters()}], lr=args.lr)
+        else:
+            optimizer = torch.optim.SGD(clsfier.parameters(), args.lr,
+                                    momentum=args.momentum,
+                                    weight_decay=args.weight_decay, nesterov=True)
+    else:
+        if args.opt == "adam":
+            optimizer = torch.optim.Adam(
+                [{'params': model.parameters(),'lr':args.lr/10},{'params': clsfier.parameters()}], lr=args.lr)
+        else:
+            optimizer = torch.optim.SGD(
+                                    itertools.chain(model.parameters(), clsfier.parameters()), 
+                                    args.lr,
+                                    momentum=args.momentum,
+                                    weight_decay=args.weight_decay, nesterov=True)
+
+    def cosine_annealing(step, total_steps, lr_max, lr_min):
+        return lr_min + (lr_max - lr_min) * 0.5 * (
+                   1 + np.cos(step / total_steps * np.pi))
+
+    if args.use_scheduler:
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
+               optimizer,
+               lr_lambda=lambda step: cosine_annealing(
+                   step,
+                   args.n_epochs * len(train_loader),
+                   1,  # since lr_lambda computes multiplicative factor
+                   1e-6 / (args.lr * args.batch_size / 256.)))
+    else:
+       scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer)
+
+    criterion = nn.BCEWithLogitsLoss()
+
+    model, clsfier, optimizer = train_model(
+        args, train_loader, val_loader, optimizer, model, clsfier, criterion, scheduler, device, use_dataparallel)
 
 
-    freeze_bn_affine = 1
-    for m in model.modules():
-        if isinstance(m, nn.BatchNorm2d):
-            m.eval()
-            if freeze_bn_affine:
-                m.weight.requires_grad = False
-                m.bias.requires_grad = False
-
-
-    optimizer = torch.optim.Adam([{'params': model.parameters(),'lr':args.l_rate/10},{'params': clsfier.parameters()}], lr=args.l_rate)
-    # optimizer = torch.optim.Adam([{'params': clsfier.parameters()}], lr=args.l_rate)
-
-
-    bceloss = nn.BCEWithLogitsLoss()
-    for epoch in range(args.n_epoch):
-        for i, (images, labels) in enumerate(trainloader):
-            if torch.cuda.is_available():
-                images = Variable(images[0].cuda(0))
-                labels = Variable(labels[0].cuda(0).float())
-            else:
-                images = Variable(images[0])
-                labels = Variable(labels[0])-1
-
-            # iterartion = len(trainloader)*epoch + i
-            # poly_lr_scheduler(optimizer, args.l_rate, iteration)
-            optimizer.zero_grad()
-         
-            outputs = model(images)
-            outputs = clsfier(outputs)
-            loss = bceloss(outputs, labels)  #-- pascal labels
-
-            loss.backward()
-            optimizer.step()
-
-            if (i+1) % 20 == 0:
-                print("Epoch [%d/%d] Loss: %.4f" % (epoch+1, args.n_epoch, loss.data))
-
-
-        torch.save(model.state_dict(), args.save_dir + args.arch + str(args.disc) +  ".pth")
-        torch.save(clsfier.state_dict(), args.save_dir + args.arch +'clssegsimp' + str(args.disc) +  ".pth")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Hyperparams')
-    parser.add_argument('--arch', nargs='?', type=str, default='resnet101', 
-                        help='Architecture to use [\'fcn32s, unet, segnet etc\']')
-    parser.add_argument('--model_path', nargs='?', type=str, default='zoomoutscratch_pascal_1_6.pkl', 
-                        help='Path to the saved model')
-    parser.add_argument('--dataset', nargs='?', type=str, default='pascal', 
-                        help='Dataset to use [\'pascal, camvid, ade20k etc\']')
-    parser.add_argument('--img_rows', nargs='?', type=int, default=352, 
+    parser.add_argument('--arch', type=str, default='resnet50',
+                        help='Architecture to use [\'resnet50, resnet101, resnet152, se, BiT-M-R50x1, BiT-M-R101x1\']')
+    parser.add_argument('--dataset', type=str, default='pascal', 
+                        help='Dataset to use [\'deepfashion2, deepaugment, pascal, coco\']')
+    parser.add_argument('--opt', type=str, default='adam',
+                        help='Optimizer to use [\'adam, sgd\']')
+    parser.add_argument('--loss', type=str, default='bce',
+                        help='Loss to use only [\'bce\']')
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help='number of workers')
+    parser.add_argument('--num_classes', type=int, default=20,
+                        help='number of workers')
+    parser.add_argument('--img_size', type=int, default=256,
                         help='Height of the input image')
-    parser.add_argument('--img_cols', nargs='?', type=int, default=352, 
-                        help='Height of the input image')
-    parser.add_argument('--n_epoch', nargs='?', type=int, default=80, 
+    parser.add_argument('-e','--n_epochs', type=int, default=80, 
                         help='# of the epochs')
-    parser.add_argument('--batch_size', nargs='?', type=int, default=40, 
+    parser.add_argument('--start_epoch', type=int, default=0,
+                        help='starting at what epoch')
+    parser.add_argument('-b','--batch_size', type=int, default=40, 
                         help='Batch Size')
-    parser.add_argument('--l_rate', nargs='?', type=float, default=1e-4, 
+    parser.add_argument('--lr', type=float, default=1e-4, 
                         help='Learning Rate')
-    parser.add_argument('--load', nargs='?', type=int)
-    parser.add_argument('--disc', nargs='?', type=str)
+    parser.add_argument('--momentum', type=float, default=0.9,   
+                        help='Learning Rate Momentum')
+    parser.add_argument('--weight_decay', type=float, default=1e-4,   
+                        help='Weight Decay')
+    parser.add_argument('--eval_every', type=int, default=2, help='how often to eval the model')
+    parser.add_argument('--scales', nargs='+', default=[2], type=int)
+    parser.add_argument('-occ', "--occlusion", nargs='+', default=[2], type=int)
+    parser.add_argument('--zoom', nargs='+', default=[1], type=int)
+    parser.add_argument('-vp', "--viewpoint", nargs='+', default=[2], type=int)
+    parser.add_argument('--negate', nargs='+', default=[False,False,False,False], type=int,
+        help='to negate occlusion, scales, viewpoint, and zoom respectively, passed in as 0, 1')
+    parser.add_argument('--use_scheduler', action='store_true')
+    parser.add_argument('--finetune', action='store_true')
+    parser.add_argument('--augmix', default=None, type=int, help="specify augmix severity.")
+    parser.add_argument('--speckle', action='store_true', help="train with speckle augmentation.")
+    parser.add_argument('--stylize', action='store_true', help="train with stylized data.")
+    parser.add_argument('--cutout', action='store_true', help="train with random erasure augmentation.")
+    parser.add_argument('--load', type=int)
+    parser.add_argument('--desc', type=str, help="model description.")
     parser.add_argument("--save_dir", type=str, default="./savedmodels/")
     args = parser.parse_args()
     train(args)

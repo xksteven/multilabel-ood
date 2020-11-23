@@ -48,13 +48,13 @@ class pascalVOCLoader(data.Dataset):
         random.seed(seed)
         if self.img_transform is not None:
             img_o = self.img_transform(img)
-            imgs = [img_o]
+            imgs = img_o
         else:
             imgs = img
         random.seed(seed)
         if self.label_transform is not None:
             label_o = self.label_transform(lbl)
-            lbls = [label_o]
+            lbls = label_o
         else:
             lbls = lbl
 

@@ -15,7 +15,6 @@ from torch.utils import data
 from PIL import Image
 from utils.dataloader.pascal_voc_loader import *
 from utils.dataloader.coco_loader import *
-from scipy.misc import toimage
 import random
 # import tqdm
 import torchvision.transforms as transforms
@@ -27,6 +26,7 @@ from sklearn import metrics
 from skimage.filters import gaussian as gblur
 from utils import anom_utils
 
+
 def flip(x, dim):
     xsize = x.size()
     dim = x.dim() + dim if dim < 0 else dim
@@ -35,11 +35,70 @@ def flip(x, dim):
                       -1, -1), ('cpu','cuda')[x.is_cuda])().long(), :]
     return x.view(xsize)
 
+def create_association_matrix(scores, num_labels, thresh=0.5, normalize=True):
+    pos_association_matrix = [[0 for _ in range(num_labels)] for _ in range(num_labels)]
+    neg_association_matrix = [[0 for _ in range(num_labels)] for _ in range(num_labels)]
+
+    labels = scores > thresh
+    for index, label in enumerate(labels):
+        for index2, l in enumerate(label):
+            
+            if l:
+                pos_association_matrix[index2] += scores[index]
+            else:
+                neg_association_matrix[index2] += scores[index]
+    pos_association_matrix = np.array(pos_association_matrix)
+    neg_association_matrix = np.array(neg_association_matrix)
+    if normalize:
+        pos_association_matrix = pos_association_matrix / pos_association_matrix.sum(axis=-1)
+        neg_association_matrix = neg_association_matrix / neg_association_matrix.sum(axis=-1)
+    return pos_association_matrix, neg_association_matrix 
+
+def get_ood_kl_score_helper(scores, pos_mat, neg_mat, thresh=0.5, normalize=True):
+    res = []
+    labels = np.array(scores) > thresh
+    for index, label in enumerate(labels):
+        tmp = 0
+        count = 0
+        for index2, l in enumerate(label): 
+            if l:
+                input  = scores[index]
+                target = pos_mat[index2]
+                #input  = pos_mat[index2]
+                #target = scores[index]
+                tmp += torch.nn.functional.mse_loss(torch.from_numpy(input), torch.from_numpy(target))
+                #tmp -= torch.nn.functional.cosine_similarity(
+                #    torch.from_numpy(input), torch.from_numpy(target), dim=-1)
+            else:
+                input  = scores[index]
+                target = neg_mat[index2]
+                #input  = neg_mat[index2]
+                #target = scores[index]
+                #tmp -= torch.nn.functional.mse_loss(torch.from_numpy(input), torch.from_numpy(target))
+                #tmp += torch.nn.functional.cosine_similarity(
+                #    torch.from_numpy(input), torch.from_numpy(target), dim=-1)
+            if normalize:
+                count += 1
+            else:
+                count = 1
+        res.append(tmp/count)
+    return res
+
+
+def get_ood_kl_score(scores, out_scores, pos_mat, neg_mat, thresh=0.5):
+    res = []
+    res.extend(get_ood_kl_score_helper(scores, pos_mat, neg_mat, thresh=thresh))
+    res.extend(get_ood_kl_score_helper(out_scores, pos_mat, neg_mat, thresh=thresh)) 
+    
+    return np.array(res)
+
+    
+
 def get_predictions(loader, model, clsfier, ood="msp", name=None):
     #gts = {i:[] for i in range(0,num_labels)}
     #preds = {i:[] for i in range(0,num_labels)}
     # gts, preds = [], []
-    print("name = ", name, os.path.exists("./logits/"+name+".npy"))
+    #print("name = ", name, os.path.exists("./logits/"+name+".npy"))
     if (ood != "dropout") and (name is not None) and (os.path.exists("./logits/"+name+".npy")):
         logits = np.load("./logits/"+name+".npy")
         
@@ -49,11 +108,17 @@ def get_predictions(loader, model, clsfier, ood="msp", name=None):
             scores = pred.max(axis=1)
         elif ood == "max_logit":
             scores = logits.max(axis=1)
+        elif ood == "sum_logit":
+            scores = logits.sum(axis=1)
         elif ood == "logit_avg":
             scores = logits.mean(axis=1)
         elif ood == "lof":
             scores = logits
         elif ood == "isol":
+            scores = logits
+        elif ood == "kl":
+            #outputs = F.sigmoid(torch.from_numpy(logits).cuda())
+            #scores = outputs.squeeze().data.cpu().numpy()
             scores = logits
         else:
             raise NameError('ood measure not implemented')
@@ -100,19 +165,21 @@ def get_predictions(loader, model, clsfier, ood="msp", name=None):
             if failed:
                 continue
 
-            #print(pred.shape)
-            #exit()
             logits.append(outputs_np)
             if ood == "msp":
                 scores.append(pred.max())
             elif ood == "max_logit":
                 scores.append(outputs_np.max())
+            elif ood == "max_logit":
+                scores.append(outputs_np.sum())
             elif ood == "logit_avg":
                 scores.append(outputs_np.mean())
             elif ood == "lof":
                 scores.append(outputs_np)
             elif ood == "isol":
                 scores.append(outputs_np)
+            elif ood == "kl":
+                 scores.append(pred)
             elif ood == "dropout":
                 img_stacks = torch.stack(img_stacks, dim=0)
                 scores.append(img_stacks.var(dim=1).mean(dim=0).squeeze().data.cpu().numpy())
@@ -186,9 +253,10 @@ def validate(args):
     save_name = "test" + args.dataset
     in_scores = get_predictions(testloader, model, clsfier, args.ood, name=save_name)
 
-    ood_root = "./datasets/ImageNet22k/images/"
+    ood_root = "./datasets/ImageNet-22K/"
     ood_subfolders = ["n02069412", "n02431122", "n02392434", "n02508213", "n01970164", "n01937909", "n12641413", "n12649317", "n12285512", "n11978713",
                       "n07691650", "n07814390", "n12176953", "n12126084", "n12132956", "n12147226", "n12356395", "n12782915", "n02139199", "n01959492"]
+
 
     #aurocs = [];
     out_scores = []
@@ -208,13 +276,35 @@ def validate(args):
         in_scores = scores[:len(in_scores)]
         out_scores = scores[-len(out_scores):]
 
-    if args.ood == "isol":
+    elif args.ood == "isol":
         save_name = "val" + args.dataset
         val_scores = get_predictions(valloader, model, clsfier, args.ood, name=save_name)
 
         scores = anom_utils.get_isolationforest_scores(val_scores, in_scores, out_scores)
         in_scores = scores[:len(in_scores)]
         out_scores = scores[-len(out_scores):]
+
+    elif args.ood == "kl":
+        save_name = "val" + args.dataset
+        #thresholds = [0.1, 0.2, 0.4, 0.5, 0.6, 0.8, 0.9]
+        in_scores = np.array(in_scores)
+        out_scores = np.array(out_scores)
+        thresholds = np.linspace(
+            np.max([in_scores.min(), out_scores.min()]) + 0.1,
+            np.min([in_scores.max(), out_scores.max()]), num=20, endpoint=False)[2:]
+        for thresh in thresholds:
+            print(f"thresh = {thresh}")
+            val_scores = get_predictions(valloader, model, clsfier, args.ood, name=save_name)
+            pos_mat, neg_mat = create_association_matrix(val_scores, n_classes, thresh=thresh)
+            scores = get_ood_kl_score(in_scores, out_scores, pos_mat, neg_mat, thresh=thresh)
+            tmp_in_scores = scores[:len(in_scores)]
+            tmp_out_scores = scores[-len(out_scores):]
+            try: 
+                auroc, aupr, fpr = anom_utils.get_and_print_results(tmp_in_scores, tmp_out_scores)
+            except:
+                break
+            print("mean auroc = ", np.mean(auroc), "mean aupr = ", np.mean(aupr), " mean fpr = ", np.mean(fpr))
+
 
 
     #if args.flippin:
@@ -226,7 +316,7 @@ def validate(args):
     #np.save('./out_scores', out_scores)
     #aurocs.append(auroc); auprs.append(aupr), fprs.append(fpr)
     #print(np.mean(aurocs), np.mean(auprs), np.mean(fprs))
-    print("mean auroc = ", np.mean(aurocs), "mean aupr = ", np.mean(auprs), " mean fpr = ", np.mean(fprs))
+    print("mean auroc = ", np.mean(auroc), "mean aupr = ", np.mean(aupr), " mean fpr = ", np.mean(fpr))
 
 
 

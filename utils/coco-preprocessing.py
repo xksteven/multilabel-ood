@@ -10,8 +10,6 @@ import os, os.path
 import pickle
 from tqdm import tqdm
 
-#pylab.rcParams['figure.figsize'] = (10.0, 8.0)
-
 parser = argparse.ArgumentParser(description="Preprocess COCO Labels.")
 
 #dataDir='/share/data/vision-greg/coco'

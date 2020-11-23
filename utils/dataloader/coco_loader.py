@@ -20,7 +20,8 @@ from scipy.io import loadmat
 
 
 class cocoloader(data.Dataset):
-    def __init__(self,root='./datasets/coco/', split="multi-label-train2014", img_transform=None, label_transform=None):
+    def __init__(self,root='/share/data/vision-greg/mlfeatsdata/Pytorch/sharedprojects/NIPS-2019/data-convertor/', split="multi-label-train2014", img_transform=None, label_transform=None):
+    #def __init__(self,root='./datasets/coco/', split="multi-label-train2014", img_transform=None, label_transform=None):
         self.root = root
         self.split = split
         self.n_classes = 80
